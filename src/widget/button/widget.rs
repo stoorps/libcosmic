@@ -842,17 +842,18 @@ pub fn update<'a, Message: Clone>(
         }
         #[cfg(feature = "a11y")]
         Event::A11y(event_id, iced_accessibility::accesskit::ActionRequest { action, .. }) => {
-            let state = state();
-            if let Some(on_press) = matches!(action, iced_accessibility::accesskit::Action::Click)
-                .then_some(on_press)
-                .flatten()
+            if let Some(on_press) = (_id == *event_id
+                && matches!(action, iced_accessibility::accesskit::Action::Click))
+            .then_some(on_press)
+            .flatten()
             {
+                let state = state();
                 state.is_pressed = false;
                 let msg = (on_press)(layout.virtual_offset(), layout.bounds());
 
                 shell.publish(msg);
+                shell.capture_event();
             }
-            shell.capture_event();
             return;
         }
         Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
@@ -1061,5 +1062,111 @@ fn removal_bounds(bounds: Rectangle, offset: f32) -> Rectangle {
         y: bounds.y - 12.0 + offset,
         width: 24.0,
         height: 24.0,
+    }
+}
+
+#[cfg(all(test, feature = "a11y"))]
+mod a11y_action_tests {
+    use super::*;
+    use iced_accessibility::accesskit::{
+        Action as AccessibleAction, ActionRequest, NodeId, TreeId,
+    };
+
+    fn event(target: Id, action: AccessibleAction) -> Event {
+        Event::A11y(
+            target,
+            ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: NodeId(42),
+                data: None,
+            },
+        )
+    }
+
+    #[test]
+    fn accessibility_click_only_activates_the_target_button() {
+        let target = Id::unique();
+        let other = Id::unique();
+        let event = event(target.clone(), AccessibleAction::Click);
+        let node = layout::Node::new(iced_core::Size::new(100.0, 30.0));
+        let mut messages = Vec::new();
+        let mut target_state = State::new();
+        let mut other_state = State::new();
+        let mut shell = Shell::new(&mut messages);
+        update(
+            other,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &mut shell,
+            Some(&|_, _| "other"),
+            None,
+            || &mut other_state,
+        );
+        assert!(
+            !shell.is_event_captured(),
+            "unrelated button consumed the event"
+        );
+        update(
+            target,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &mut shell,
+            Some(&|_, _| "target"),
+            None,
+            || &mut target_state,
+        );
+        assert!(shell.is_event_captured());
+        assert_eq!(messages, ["target"]);
+    }
+
+    #[test]
+    fn accessibility_click_does_not_touch_an_unrelated_button_state() {
+        let event = event(Id::unique(), AccessibleAction::Click);
+        let node = layout::Node::new(iced_core::Size::new(100.0, 30.0));
+        let mut messages = Vec::<()>::new();
+        let mut shell = Shell::new(&mut messages);
+        update(
+            Id::unique(),
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &mut shell,
+            Some(&|_, _| ()),
+            None,
+            || panic!("unrelated state accessed"),
+        );
+        assert!(!shell.is_event_captured());
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn disabled_buttons_and_unsupported_accessibility_actions_are_inert() {
+        let target = Id::unique();
+        let node = layout::Node::new(iced_core::Size::new(100.0, 30.0));
+        for (action, enabled) in [
+            (AccessibleAction::Click, false),
+            (AccessibleAction::Focus, true),
+        ] {
+            let event = event(target.clone(), action);
+            let mut messages = Vec::<()>::new();
+            let mut shell = Shell::new(&mut messages);
+            let handler = |_, _| ();
+            let callback = enabled.then_some(&handler as &dyn Fn(Vector, Rectangle));
+            update(
+                target.clone(),
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &mut shell,
+                callback,
+                None,
+                || panic!("inert action accessed button state"),
+            );
+            assert!(!shell.is_event_captured());
+            assert!(messages.is_empty());
+        }
     }
 }
