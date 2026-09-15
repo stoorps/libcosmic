@@ -125,6 +125,8 @@ where
                 .padding(8)
                 .into(),
         );
+    // Password semantics do not disappear when the visual reveal button is used.
+    input.is_protected = true;
     if hidden {
         input = input.password();
     }
@@ -179,8 +181,10 @@ pub(crate) const SUPPORTED_TEXT_MIME_TYPES: &[&str; 6] = &[
 pub struct TextInput<'a, Message> {
     id: Id,
     placeholder: Cow<'a, str>,
+    accessible_name: Option<Cow<'a, str>>,
     value: Value,
     is_secure: bool,
+    is_protected: bool,
     is_editable_variant: bool,
     is_read_only: bool,
     select_on_focus: bool,
@@ -230,8 +234,10 @@ where
         TextInput {
             id: Id::unique(),
             placeholder: placeholder.into(),
+            accessible_name: None,
             value: Value::new(v.as_ref()),
             is_secure: false,
+            is_protected: false,
             is_editable_variant: false,
             is_read_only: false,
             select_on_focus: false,
@@ -289,6 +295,12 @@ where
         self
     }
 
+    /// Names a field for assistive technology without adding a visible label.
+    pub fn accessible_name(mut self, name: impl Into<Cow<'a, str>>) -> Self {
+        self.accessible_name = Some(name.into());
+        self
+    }
+
     /// Sets the helper text of the [`TextInput`].
     pub fn helper_text(mut self, helper_text: impl Into<Cow<'a, str>>) -> Self {
         self.helper_text = Some(helper_text.into());
@@ -318,7 +330,118 @@ where
     #[inline]
     pub const fn password(mut self) -> Self {
         self.is_secure = true;
+        self.is_protected = true;
         self
+    }
+
+    #[cfg(feature = "a11y")]
+    fn accessible_tree(&self, state: &State, bounds: Rectangle) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+        use iced_accessibility::{A11yNode, A11yTree};
+
+        let mut node = Node::new(if self.is_protected {
+            Role::PasswordInput
+        } else {
+            Role::TextInput
+        });
+        node.set_label(
+            self.accessible_name
+                .as_deref()
+                .or(self.label.as_deref())
+                .unwrap_or(&self.placeholder),
+        );
+        if let Some(id) = self.id.author_id() {
+            node.set_author_id(id);
+        }
+        if let Some(description) = self.error.as_deref().or(self.helper_text.as_deref()) {
+            node.set_description(description);
+        }
+        node.set_bounds(Rect::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            (bounds.x + bounds.width) as f64,
+            (bounds.y + bounds.height) as f64,
+        ));
+        if self.on_input.is_none() && !self.manage_value {
+            node.set_disabled();
+        } else {
+            node.add_action(Action::Focus);
+            if !state.is_read_only {
+                node.add_action(Action::SetValue);
+            }
+        }
+        if state.is_read_only {
+            node.set_read_only();
+        }
+        // Never place a protected value in the tree, including its text-run children.
+        let value = if self.is_protected {
+            self.value.secure()
+        } else {
+            self.value.clone()
+        }
+        .to_string();
+        node.set_value(value.clone());
+        let mut run = Node::new(Role::TextRun);
+        run.set_character_lengths(
+            value
+                .chars()
+                .map(|ch| ch.len_utf8() as u8)
+                .collect::<Vec<_>>(),
+        );
+        run.set_value(value);
+        A11yTree::node_with_child_tree(
+            A11yNode::new(node, self.id.clone()),
+            A11yTree::leaf(run, state.a11y_text_id.clone()),
+        )
+    }
+
+    #[cfg(feature = "a11y")]
+    fn accessible_action(
+        &mut self,
+        event: &Event,
+        state: &mut State,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        use iced_accessibility::accesskit::{Action, ActionData, NodeId};
+        let Event::A11y(target, request) = event else {
+            return;
+        };
+        if u64::from(target.clone()) != u64::from(self.id.clone())
+            || request.target_node != NodeId(u64::from(self.id.clone()))
+            || (self.on_input.is_none() && !self.manage_value)
+        {
+            return;
+        }
+        match (&request.action, &request.data) {
+            (Action::Focus, None) => {
+                let was_focused =
+                    state.is_focused() && !state.is_focused.is_some_and(|focus| focus.needs_update);
+                let read_only = state.is_read_only;
+                state.focus();
+                // Accessibility focus must not enable editing of a read-only field.
+                state.is_read_only = read_only;
+                if !was_focused {
+                    if let Some(message) = self.on_focus.as_ref() {
+                        shell.publish(message.clone());
+                    }
+                }
+            }
+            (Action::SetValue, Some(ActionData::Value(value))) if !state.is_read_only => {
+                let value: String = value.chars().filter(|ch| !ch.is_control()).collect();
+                self.value = Value::new(&value);
+                state.tracked_value = self.value.clone();
+                state.cursor.move_to(self.value.len());
+                state.preedit = None;
+                state.dirty = true;
+                if let Some(on_input) = self.on_input.as_ref() {
+                    shell.publish(on_input(value));
+                }
+                shell.invalidate_layout();
+            }
+            _ => return,
+        }
+        shell.request_redraw();
+        shell.capture_event();
     }
 
     /// Applies behaviors unique to the `editable_input` variable.
@@ -831,8 +954,29 @@ where
         operation.container(Some(&self.id), layout.bounds());
         let state = tree.state.downcast_mut::<State>();
 
-        operation.focusable(Some(&self.id), layout.bounds(), state);
+        if self.on_input.is_some() || self.manage_value {
+            operation.focusable(Some(&self.id), layout.bounds(), state);
+        }
         operation.text_input(Some(&self.id), layout.bounds(), state);
+        if !tree.children.is_empty() {
+            let layouts: Vec<_> = self.text_layout(layout).children().skip(1).collect();
+            operation.traverse(&mut |operation| {
+                for ((child, state), child_layout) in self
+                    .leading_icon
+                    .iter_mut()
+                    .chain(self.trailing_icon.iter_mut())
+                    .zip(&mut tree.children)
+                    .zip(&layouts)
+                {
+                    child.as_widget_mut().operate(
+                        state,
+                        child_layout.with_virtual_offset(layout.virtual_offset()),
+                        renderer,
+                        operation,
+                    );
+                }
+            });
+        }
     }
 
     fn overlay<'b>(
@@ -884,6 +1028,13 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        #[cfg(feature = "a11y")]
+        {
+            self.accessible_action(event, tree.state.downcast_mut::<State>(), shell);
+            if shell.is_event_captured() {
+                return;
+            }
+        }
         let text_layout = self.text_layout(layout);
         let mut trailing_icon_layout = None;
         let font = self.font.unwrap_or_else(|| renderer.default_font());
@@ -902,6 +1053,26 @@ where
                     f.needs_update = false;
                     state.is_read_only = true;
                     shell.publish((on_edit)(f.focused));
+                }
+            }
+        }
+
+        if let Some(leading) = self.leading_icon.as_mut() {
+            if let (Some(child_tree), Some(child_layout)) =
+                (tree.children.first_mut(), text_layout.children().nth(1))
+            {
+                leading.as_widget_mut().update(
+                    child_tree,
+                    event,
+                    child_layout,
+                    cursor_position,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+                if shell.is_event_captured() {
+                    return;
                 }
             }
         }
@@ -1094,6 +1265,35 @@ where
     }
 
     #[inline]
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        let field = self.accessible_tree(tree.state.downcast_ref::<State>(), layout.bounds());
+        if tree.children.is_empty() {
+            return field;
+        }
+        // Buttons are siblings, not text runs: they must not become part of
+        // the field's readable text (especially for protected values).
+        let children = self
+            .leading_icon
+            .iter()
+            .chain(self.trailing_icon.iter())
+            .zip(&tree.children)
+            .zip(self.text_layout(layout).children().skip(1))
+            .map(|((child, state), child_layout)| {
+                child.as_widget().a11y_nodes(
+                    child_layout.with_virtual_offset(layout.virtual_offset()),
+                    state,
+                    _cursor,
+                )
+            });
+        iced_accessibility::A11yTree::join(std::iter::once(field).chain(children))
+    }
+
     fn id(&self) -> Option<Id> {
         Some(self.id.clone())
     }
@@ -2914,9 +3114,11 @@ pub(crate) enum DndOfferState {
 pub(crate) struct DndOfferState;
 
 /// The state of a [`TextInput`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct State {
+    #[cfg(feature = "a11y")]
+    a11y_text_id: Id,
     pub tracked_value: Value,
     pub value: crate::Plain,
     pub placeholder: crate::Plain,
@@ -2947,6 +3149,12 @@ struct Focus {
     needs_update: bool,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::focused(false, false)
+    }
+}
+
 impl State {
     /// Creates a new [`State`], representing an unfocused [`TextInput`].
     pub fn new(
@@ -2957,6 +3165,8 @@ impl State {
     ) -> Self {
         Self {
             is_secure,
+            #[cfg(feature = "a11y")]
+            a11y_text_id: Id::unique(),
             is_read_only,
             is_focused: always_active.then(|| {
                 let now = Instant::now();
@@ -2999,6 +3209,8 @@ impl State {
     /// Creates a new [`State`], representing a focused [`TextInput`].
     pub fn focused(is_secure: bool, is_read_only: bool) -> Self {
         Self {
+            #[cfg(feature = "a11y")]
+            a11y_text_id: Id::unique(),
             tracked_value: Value::default(),
             is_secure,
             value: crate::Plain::default(),
@@ -3123,17 +3335,22 @@ impl operation::Focusable for State {
 
     #[inline]
     fn focus(&mut self) {
+        let was_focused = self.is_focused();
+        let read_only = self.is_read_only;
         Self::focus(self);
+        self.is_read_only = read_only;
         if let Some(focus) = self.is_focused.as_mut() {
-            focus.needs_update = true;
+            focus.needs_update = !was_focused;
         }
     }
 
     #[inline]
     fn unfocus(&mut self) {
+        let was_focused = self.is_focused();
         Self::unfocus(self);
+        self.emit_unfocus |= was_focused;
         if let Some(focus) = self.is_focused.as_mut() {
-            focus.needs_update = true;
+            focus.needs_update = was_focused;
         }
     }
 }
@@ -3330,5 +3547,292 @@ fn effective_alignment(paragraph: &impl text::Paragraph) -> alignment::Horizonta
         alignment::Horizontal::Right
     } else {
         alignment::Horizontal::Left
+    }
+}
+
+#[cfg(all(test, feature = "a11y"))]
+mod form_a11y_tests {
+    use super::*;
+    use iced_accessibility::accesskit::{Action, ActionData, ActionRequest, NodeId, Role, TreeId};
+
+    fn request(id: &Id, action: Action, data: Option<ActionData>) -> Event {
+        let numeric = u64::from(id.clone());
+        // Use the numeric identity produced by the real runtime, not the author's custom ID.
+        Event::A11y(
+            Id::from(numeric),
+            ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: NodeId(numeric),
+                data,
+            },
+        )
+    }
+
+    #[test]
+    fn text_node_has_label_identity_value_and_stable_text_run() {
+        let input = TextInput::new("placeholder", "e\u{301}🦀")
+            .label("Volume Name")
+            .id(Id::new("volume.name"))
+            .on_input(|value| value);
+        let state = State::default();
+        let tree = input.accessible_tree(&state, Rectangle::default());
+        let node = tree.root()[0].node();
+        assert_eq!(node.role(), Role::TextInput);
+        assert_eq!(node.label(), Some("Volume Name"));
+        assert_eq!(node.author_id(), Some("volume.name"));
+        assert_eq!(node.value(), Some("e\u{301}🦀"));
+        assert!(node.supports_action(Action::SetValue));
+        assert_eq!(tree.children()[0].node().character_lengths(), &[1, 2, 4]);
+        assert_eq!(
+            tree.children()[0].id(),
+            input
+                .accessible_tree(&state, Rectangle::default())
+                .children()[0]
+                .id()
+        );
+    }
+
+    #[test]
+    fn secure_input_never_exposes_plaintext_even_when_visually_revealed() {
+        for hidden in [true, false] {
+            let input = secure_input("Passphrase", "SECRET-e\u{301}🦀", None::<String>, hidden)
+                .on_input(|value| value);
+            let tree = input.accessible_tree(&State::default(), Rectangle::default());
+            assert_eq!(tree.root()[0].node().role(), Role::PasswordInput);
+            let masked = Value::new("SECRET-e\u{301}🦀").secure().to_string();
+            assert_eq!(tree.root()[0].node().value(), Some(masked.as_str()));
+            assert_eq!(tree.children()[0].node().value(), Some(masked.as_str()));
+            assert!(!format!("{tree:?}").contains("SECRET"));
+        }
+    }
+
+    #[test]
+    fn value_action_updates_unicode_state_and_callback_once() {
+        let mut input = TextInput::new("name", "old")
+            .id(Id::new("name"))
+            .on_input(|value| value);
+        let mut state = State::default();
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        input.accessible_action(
+            &request(
+                &input.id,
+                Action::SetValue,
+                Some(ActionData::Value("e\u{301}🦀\n\t".into())),
+            ),
+            &mut state,
+            &mut shell,
+        );
+        assert!(shell.is_event_captured());
+        assert!(shell.is_layout_invalid());
+        assert!(state.dirty);
+        assert_eq!(input.value.to_string(), "e\u{301}🦀");
+        assert_eq!(state.tracked_value, input.value);
+        assert_eq!(state.cursor.state(&input.value), cursor::State::Index(2));
+        assert_eq!(messages, ["e\u{301}🦀"]);
+    }
+
+    #[test]
+    fn unsupported_malformed_and_other_target_requests_are_inert() {
+        let mut input = TextInput::new("name", "old").on_input(|value| value);
+        let mut mismatched = request(
+            &input.id,
+            Action::SetValue,
+            Some(ActionData::Value("bad".into())),
+        );
+        if let Event::A11y(_, ref mut action) = mismatched {
+            action.target_node = NodeId(u64::MAX);
+        }
+        for event in [
+            request(
+                &Id::unique(),
+                Action::SetValue,
+                Some(ActionData::Value("bad".into())),
+            ),
+            request(&input.id, Action::SetValue, None),
+            request(
+                &input.id,
+                Action::SetValue,
+                Some(ActionData::NumericValue(5.0)),
+            ),
+            request(&input.id, Action::Click, None),
+            request(
+                &input.id,
+                Action::Focus,
+                Some(ActionData::Value("bad".into())),
+            ),
+            mismatched,
+        ] {
+            let mut state = State::default();
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            input.accessible_action(&event, &mut state, &mut shell);
+            assert!(!shell.is_event_captured());
+            assert!(!state.is_focused());
+            assert_eq!(input.value.to_string(), "old");
+            assert!(messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_and_read_only_fields_do_not_accept_value_actions() {
+        for disabled in [true, false] {
+            let mut input = TextInput::new("name", "old");
+            if !disabled {
+                input = input.on_input(|value| value);
+            }
+            let mut state = State::new(false, !disabled, false, false);
+            let tree = input.accessible_tree(&state, Rectangle::default());
+            assert!(!tree.root()[0].node().supports_action(Action::SetValue));
+            assert_eq!(tree.root()[0].node().is_disabled(), disabled);
+            assert_eq!(tree.root()[0].node().is_read_only(), !disabled);
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            input.accessible_action(
+                &request(
+                    &input.id,
+                    Action::SetValue,
+                    Some(ActionData::Value("bad".into())),
+                ),
+                &mut state,
+                &mut shell,
+            );
+            assert!(!shell.is_event_captured());
+            assert_eq!(input.value.to_string(), "old");
+            input.accessible_action(
+                &request(&input.id, Action::Focus, None),
+                &mut state,
+                &mut shell,
+            );
+            assert_eq!(state.is_focused(), !disabled);
+            assert_eq!(state.is_read_only, !disabled);
+            assert!(messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_input_updates_without_an_application_callback() {
+        let mut input = TextInput::<String>::new("name", "old");
+        input.manage_value = true;
+        let mut state = State::default();
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        input.accessible_action(
+            &request(
+                &input.id,
+                Action::SetValue,
+                Some(ActionData::Value("new".into())),
+            ),
+            &mut state,
+            &mut shell,
+        );
+        assert!(shell.is_event_captured());
+        assert_eq!(state.tracked_value.to_string(), "new");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn widget_trait_publishes_the_field_not_just_the_node_helper() {
+        let input = TextInput::new("Volume Name", "data").on_input(|value| value);
+        let tree = Tree::new(&input as &dyn Widget<String, crate::Theme, crate::Renderer>);
+        let layout = layout::Node::new(Size::new(200.0, 32.0));
+        let nodes = input.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+        assert_eq!(nodes.root().len(), 1);
+        assert_eq!(nodes.root()[0].node().label(), Some("Volume Name"));
+        assert_eq!(nodes.root()[0].node().value(), Some("data"));
+        assert_eq!(nodes.root()[0].node().bounds().unwrap().width(), 200.0);
+    }
+
+    #[test]
+    fn repeated_focus_does_not_repeat_the_application_callback() {
+        let mut input = TextInput::new("name", "old")
+            .on_input(|value| value)
+            .on_focus("focused".into());
+        let mut state = State::default();
+        let event = request(&input.id, Action::Focus, None);
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            input.accessible_action(&event, &mut state, &mut Shell::new(&mut messages));
+        }
+        assert!(state.is_focused());
+        assert_eq!(messages, ["focused"]);
+    }
+
+    #[test]
+    fn direct_password_builder_and_empty_replacement_remain_protected() {
+        let mut input = TextInput::new("Passphrase", "SECRET")
+            .password()
+            .on_input(|value| value);
+        let mut state = State::default();
+        let mut messages = Vec::new();
+        input.accessible_action(
+            &request(
+                &input.id,
+                Action::SetValue,
+                Some(ActionData::Value("".into())),
+            ),
+            &mut state,
+            &mut Shell::new(&mut messages),
+        );
+        let nodes = input.accessible_tree(&state, Rectangle::default());
+        assert_eq!(nodes.root()[0].node().role(), Role::PasswordInput);
+        assert_eq!(nodes.root()[0].node().value(), Some(""));
+        assert!(nodes.children()[0].node().character_lengths().is_empty());
+        assert_eq!(messages, [""]);
+    }
+
+    #[test]
+    fn operation_focus_preserves_read_only_and_emits_callback_once() {
+        let mut input = TextInput::new("name", "value")
+            .on_input(|s| s)
+            .on_focus("focused".into());
+        let mut state = State::new(false, true, false, false);
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            operation::Focusable::focus(&mut state);
+            assert!(state.is_read_only);
+            input.accessible_action(
+                &request(&input.id, Action::Focus, None),
+                &mut state,
+                &mut Shell::new(&mut messages),
+            );
+            assert!(state.is_read_only);
+        }
+        assert_eq!(messages, ["focused"]);
+        operation::Focusable::unfocus(&mut state);
+        assert!(state.emit_unfocus);
+    }
+
+    #[test]
+    fn child_button_nodes_are_exposed_outside_protected_text() {
+        let input = TextInput::new("Passphrase", "SECRET")
+            .password()
+            .on_input(|s| s)
+            .trailing_icon(
+                crate::widget::button::custom(crate::widget::Space::new())
+                    .name("Reveal")
+                    .on_press("reveal".into())
+                    .into(),
+            );
+        let tree = Tree::new(&input as &dyn Widget<String, crate::Theme, crate::Renderer>);
+        let layout = layout::Node::with_children(
+            Size::new(200.0, 32.0),
+            vec![layout::Node::with_children(
+                Size::new(200.0, 32.0),
+                vec![
+                    layout::Node::new(Size::new(160.0, 32.0)),
+                    layout::Node::with_children(
+                        Size::new(32.0, 32.0),
+                        vec![layout::Node::new(Size::ZERO)],
+                    ),
+                ],
+            )],
+        );
+        let nodes = input.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+        assert_eq!(nodes.root().len(), 2);
+        assert_eq!(nodes.root()[1].node().label(), Some("Reveal"));
+        assert!(nodes.root()[1].node().supports_action(Action::Click));
+        assert!(!format!("{nodes:?}").contains("SECRET"));
     }
 }
