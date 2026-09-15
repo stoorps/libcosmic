@@ -684,6 +684,9 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
         let is_hovered = state.state.downcast_ref::<State>().is_hovered;
 
         let mut node = Node::new(Role::Button);
+        if let Some(author_id) = self.id.author_id() {
+            node.set_author_id(author_id);
+        }
         node.add_action(Action::Focus);
         node.add_action(Action::Click);
         node.set_bounds(bounds);
@@ -841,9 +844,11 @@ pub fn update<'a, Message: Clone>(
             }
         }
         #[cfg(feature = "a11y")]
-        Event::A11y(event_id, iced_accessibility::accesskit::ActionRequest { action, .. }) => {
-            if let Some(on_press) = (_id == *event_id
-                && matches!(action, iced_accessibility::accesskit::Action::Click))
+        Event::A11y(event_id, request) => {
+            if let Some(on_press) = (u64::from(_id.clone()) == u64::from(event_id.clone())
+                && request.target_node.0 == u64::from(_id.clone())
+                && request.data.is_none()
+                && matches!(request.action, iced_accessibility::accesskit::Action::Click))
             .then_some(on_press)
             .flatten()
             {
@@ -1073,12 +1078,13 @@ mod a11y_action_tests {
     };
 
     fn event(target: Id, action: AccessibleAction) -> Event {
+        let numeric = u64::from(target);
         Event::A11y(
-            target,
+            Id::from(numeric),
             ActionRequest {
                 action,
                 target_tree: TreeId::ROOT,
-                target_node: NodeId(42),
+                target_node: NodeId(numeric),
                 data: None,
             },
         )
@@ -1086,7 +1092,7 @@ mod a11y_action_tests {
 
     #[test]
     fn accessibility_click_only_activates_the_target_button() {
-        let target = Id::unique();
+        let target = Id::new("named.button");
         let other = Id::unique();
         let event = event(target.clone(), AccessibleAction::Click);
         let node = layout::Node::new(iced_core::Size::new(100.0, 30.0));
