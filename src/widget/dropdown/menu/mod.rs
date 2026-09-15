@@ -4,6 +4,7 @@
 
 mod appearance;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use appearance::{Appearance, StyleSheet};
@@ -28,6 +29,7 @@ where
     [S]: std::borrow::ToOwned,
 {
     state: State,
+    is_open: Option<Arc<AtomicBool>>,
     options: Cow<'a, [S]>,
     icons: Cow<'a, [icon::Handle]>,
     hovered_option: Arc<Mutex<Option<usize>>>,
@@ -60,6 +62,7 @@ where
     ) -> Self {
         Menu {
             state,
+            is_open: None,
             options,
             icons,
             hovered_option,
@@ -73,6 +76,11 @@ where
             style: Default::default(),
             close_on_selected,
         }
+    }
+
+    pub(crate) fn open_state(mut self, is_open: Arc<AtomicBool>) -> Self {
+        self.is_open = Some(is_open);
+        self
     }
 
     /// Sets the width of the [`Menu`].
@@ -131,6 +139,36 @@ where
 #[derive(Debug, Clone)]
 pub struct State {
     pub(crate) tree: RcWrapper<Tree>,
+    #[cfg(feature = "a11y")]
+    id: iced_core::widget::Id,
+    #[cfg(feature = "a11y")]
+    options: Arc<Mutex<OptionIdentity>>,
+}
+
+#[cfg(feature = "a11y")]
+#[derive(Debug, Default)]
+struct OptionIdentity {
+    labels: Vec<String>,
+    ids: Vec<iced_core::widget::Id>,
+}
+
+#[cfg(feature = "a11y")]
+impl OptionIdentity {
+    fn sync<S: AsRef<str>>(&mut self, options: &[S]) -> Vec<iced_core::widget::Id> {
+        if self
+            .labels
+            .iter()
+            .map(String::as_str)
+            .ne(options.iter().map(AsRef::as_ref))
+        {
+            self.labels = options.iter().map(|s| s.as_ref().to_owned()).collect();
+            self.ids = options
+                .iter()
+                .map(|_| iced_core::widget::Id::unique())
+                .collect();
+        }
+        self.ids.clone()
+    }
 }
 
 impl State {
@@ -138,6 +176,10 @@ impl State {
     pub fn new() -> Self {
         Self {
             tree: RcWrapper::new(Tree::empty()),
+            #[cfg(feature = "a11y")]
+            id: iced_core::widget::Id::unique(),
+            #[cfg(feature = "a11y")]
+            options: Arc::new(Mutex::new(OptionIdentity::default())),
         }
     }
 }
@@ -168,6 +210,7 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
     {
         let Menu {
             state,
+            is_open,
             options,
             icons,
             hovered_option,
@@ -182,8 +225,17 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             close_on_selected,
         } = menu;
 
+        #[cfg(feature = "a11y")]
+        let option_ids = state.options.lock().unwrap().sync(&options);
         let mut container = Container::new(Scrollable::new(
             Container::new(List {
+                is_open,
+                #[cfg(feature = "a11y")]
+                id: state.id.clone(),
+                #[cfg(feature = "a11y")]
+                option_ids,
+                #[cfg(feature = "a11y")]
+                live_options: state.options.clone(),
                 options,
                 icons,
                 hovered_option,
@@ -308,6 +360,15 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
 impl<'a, Message: Clone + 'a> iced_core::Overlay<Message, crate::Theme, crate::Renderer>
     for Overlay<'a, Message>
 {
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.state
+            .with_data(|tree| self.container.a11y_nodes(layout, tree, cursor))
+    }
     fn layout(&mut self, renderer: &crate::Renderer, bounds: Size) -> layout::Node {
         self._layout(renderer, bounds)
     }
@@ -348,6 +409,16 @@ impl<'a, Message: Clone + 'a> iced_core::Overlay<Message, crate::Theme, crate::R
 impl<'a, Message: Clone + 'a> crate::widget::Widget<Message, crate::Theme, crate::Renderer>
     for Overlay<'a, Message>
 {
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.state
+            .with_data(|tree| self.container.a11y_nodes(layout, tree, cursor))
+    }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fixed(self.width), Length::Shrink)
     }
@@ -413,6 +484,13 @@ struct List<'a, S: AsRef<str>, Message>
 where
     [S]: std::borrow::ToOwned,
 {
+    is_open: Option<Arc<AtomicBool>>,
+    #[cfg(feature = "a11y")]
+    id: iced_core::widget::Id,
+    #[cfg(feature = "a11y")]
+    option_ids: Vec<iced_core::widget::Id>,
+    #[cfg(feature = "a11y")]
+    live_options: Arc<Mutex<OptionIdentity>>,
     options: Cow<'a, [S]>,
     icons: Cow<'a, [icon::Handle]>,
     hovered_option: Arc<Mutex<Option<usize>>>,
@@ -423,6 +501,55 @@ where
     padding: Padding,
     text_size: Option<f32>,
     text_line_height: text::LineHeight,
+}
+
+#[cfg(feature = "a11y")]
+impl<S: AsRef<str>, Message: Clone> List<'_, S, Message>
+where
+    [S]: std::borrow::ToOwned,
+{
+    fn accessible_action(&mut self, event: &Event, shell: &mut Shell<'_, Message>) {
+        use iced_accessibility::accesskit::{Action, NodeId, TreeId};
+        if self
+            .is_open
+            .as_ref()
+            .is_some_and(|open| !open.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let Event::A11y(target, request) = event else {
+            return;
+        };
+        if request.action != Action::Click
+            || request.data.is_some()
+            || request.target_tree != TreeId::ROOT
+            || request.target_node != NodeId(u64::from(target.clone()))
+        {
+            return;
+        }
+        let index = self
+            .option_ids
+            .iter()
+            .position(|id| u64::from(id.clone()) == request.target_node.0);
+        let live = self
+            .live_options
+            .lock()
+            .unwrap()
+            .ids
+            .iter()
+            .any(|id| u64::from(id.clone()) == request.target_node.0);
+        if let Some(index) = index.filter(|i| *i < self.options.len() && live) {
+            shell.publish((self.on_selected)(index));
+            if let Some(close) = self.close_on_selected.as_ref() {
+                shell.publish(close.clone());
+            }
+            if let Some(open) = self.is_open.as_ref() {
+                open.store(false, Ordering::Relaxed);
+            }
+            shell.capture_event();
+            shell.request_redraw();
+        }
+    }
 }
 
 impl<S: AsRef<str>, Message> Widget<Message, crate::Theme, crate::Renderer> for List<'_, S, Message>
@@ -472,6 +599,71 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if self
+            .is_open
+            .as_ref()
+            .is_some_and(|open| !open.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        #[cfg(feature = "a11y")]
+        if matches!(event, Event::A11y(..)) {
+            self.accessible_action(event, shell);
+            return;
+        }
+        if let Event::Keyboard(iced_core::keyboard::Event::KeyPressed { key, .. }) = event {
+            use iced_core::keyboard::{Key, key::Named};
+            match key {
+                Key::Named(Named::ArrowDown | Named::ArrowUp | Named::Home | Named::End)
+                    if !self.options.is_empty() =>
+                {
+                    let mut hovered = self.hovered_option.lock().unwrap();
+                    let current = hovered
+                        .or(self.selected_option)
+                        .filter(|i| *i < self.options.len());
+                    let next = match key {
+                        Key::Named(Named::ArrowUp) => current.unwrap_or(0).saturating_sub(1),
+                        Key::Named(Named::End) => self.options.len() - 1,
+                        Key::Named(Named::Home) => 0,
+                        _ => current.map_or(0, |i| (i + 1).min(self.options.len() - 1)),
+                    };
+                    *hovered = Some(next);
+                    if let Some(on_hovered) = self.on_option_hovered {
+                        shell.publish(on_hovered(next));
+                    }
+                }
+                key if *key == Key::Named(Named::Enter) || key.as_ref() == Key::Character(" ") => {
+                    if let Some(index) = (*self.hovered_option.lock().unwrap())
+                        .or(self.selected_option)
+                        .filter(|i| *i < self.options.len())
+                    {
+                        shell.publish((self.on_selected)(index));
+                        if let Some(close) = self.close_on_selected.as_ref() {
+                            shell.publish(close.clone());
+                        }
+                        if let Some(open) = self.is_open.as_ref() {
+                            open.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Key::Named(Named::Escape | Named::Tab) => {
+                    if let Some(close) = self.close_on_selected.as_ref() {
+                        shell.publish(close.clone());
+                    }
+                    if let Some(open) = self.is_open.as_ref() {
+                        open.store(false, Ordering::Relaxed);
+                    }
+                    shell.request_redraw();
+                    if *key == Key::Named(Named::Tab) {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let hovered_guard = self.hovered_option.lock().unwrap();
@@ -533,6 +725,58 @@ where
             }
             _ => {}
         }
+    }
+
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _: &Tree,
+        _: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+        use iced_accessibility::{A11yNode, A11yTree};
+        if self
+            .is_open
+            .as_ref()
+            .is_some_and(|open| !open.load(Ordering::Relaxed))
+        {
+            return A11yTree::default();
+        }
+        let bounds = layout.bounds();
+        let height = f32::from(
+            self.text_line_height
+                .to_absolute(Pixels(self.text_size.unwrap_or(14.0))),
+        ) + self.padding.y();
+        let options =
+            self.options
+                .iter()
+                .zip(&self.option_ids)
+                .enumerate()
+                .map(|(i, (option, id))| {
+                    let mut node = Node::new(Role::ListBoxOption);
+                    node.set_label(option.as_ref());
+                    node.set_selected(self.selected_option == Some(i));
+                    node.add_action(Action::Click);
+                    node.set_bounds(Rect::new(
+                        bounds.x as f64,
+                        (bounds.y + i as f32 * height) as f64,
+                        (bounds.x + bounds.width) as f64,
+                        (bounds.y + (i + 1) as f32 * height) as f64,
+                    ));
+                    A11yTree::leaf(node, id.clone())
+                });
+        let mut node = Node::new(Role::ListBox);
+        node.set_bounds(Rect::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            (bounds.x + bounds.width) as f64,
+            (bounds.y + bounds.height) as f64,
+        ));
+        A11yTree::node_with_child_tree(
+            A11yNode::new(node, self.id.clone()),
+            A11yTree::join(options),
+        )
     }
 
     fn mouse_interaction(
@@ -699,5 +943,112 @@ where
 {
     fn from(list: List<'a, S, Message>) -> Self {
         Element::new(list)
+    }
+}
+
+#[cfg(all(test, feature = "a11y"))]
+mod a11y_tests {
+    use super::*;
+    use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+
+    fn list() -> List<'static, &'static str, usize> {
+        let mut identity = OptionIdentity::default();
+        let option_ids = identity.sync(&["ext4", "btrfs"]);
+        List {
+            is_open: Some(Arc::new(AtomicBool::new(true))),
+            id: iced_core::widget::Id::unique(),
+            option_ids,
+            live_options: Arc::new(Mutex::new(identity)),
+            options: Cow::Borrowed(&["ext4", "btrfs"]),
+            icons: Cow::Borrowed(&[]),
+            hovered_option: Arc::new(Mutex::new(None)),
+            selected_option: Some(0),
+            on_selected: Box::new(|i| i),
+            close_on_selected: Some(99),
+            on_option_hovered: None,
+            padding: Padding::ZERO,
+            text_size: Some(14.0),
+            text_line_height: text::LineHeight::Relative(1.0),
+        }
+    }
+    fn click(id: &iced_core::widget::Id) -> Event {
+        let n = u64::from(id.clone());
+        Event::A11y(
+            iced_core::widget::Id::from(n),
+            ActionRequest {
+                action: Action::Click,
+                target_node: NodeId(n),
+                target_tree: TreeId::ROOT,
+                data: None,
+            },
+        )
+    }
+    #[test]
+    fn options_have_distinct_stable_ids_and_replacements_invalidate_stale_targets() {
+        let mut ids = OptionIdentity::default();
+        let before = ids.sync(&["same", "same"]);
+        assert_ne!(before[0], before[1]);
+        assert_eq!(before, ids.sync(&["same", "same"]));
+        let after = ids.sync(&["other", "same"]);
+        assert!(before.iter().all(|old| !after.contains(old)));
+        assert!(ids.sync::<&str>(&[]).is_empty());
+    }
+    #[test]
+    fn actual_option_nodes_include_selected_state_bounds_and_no_closed_items() {
+        let list = list();
+        let layout = layout::Node::new(Size::new(100.0, 28.0)).move_to(Point::new(5.0, 10.0));
+        let nodes = list.a11y_nodes(
+            Layout::new(&layout),
+            &Tree::empty(),
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(nodes.root()[0].node().role(), Role::ListBox);
+        assert_eq!(nodes.children().len(), 2);
+        assert_eq!(nodes.children()[0].node().label(), Some("ext4"));
+        assert_eq!(nodes.children()[0].node().is_selected(), Some(true));
+        assert_eq!(nodes.children()[1].node().is_selected(), Some(false));
+        assert_eq!(nodes.children()[1].node().bounds().unwrap().y0, 24.0);
+        list.is_open
+            .as_ref()
+            .unwrap()
+            .store(false, Ordering::Relaxed);
+        assert!(
+            list.a11y_nodes(
+                Layout::new(&layout),
+                &Tree::empty(),
+                mouse::Cursor::Unavailable
+            )
+            .root()
+            .is_empty()
+        );
+    }
+    #[test]
+    fn targeted_selection_calls_application_and_popup_close_once() {
+        let mut list = list();
+        let event = click(&list.option_ids[1]);
+        let mut messages = Vec::new();
+        list.accessible_action(&event, &mut Shell::new(&mut messages));
+        assert_eq!(messages, [1, 99]);
+        assert!(!list.is_open.as_ref().unwrap().load(Ordering::Relaxed));
+        list.accessible_action(&event, &mut Shell::new(&mut messages));
+        assert_eq!(messages, [1, 99]);
+    }
+    #[test]
+    fn stale_unknown_or_unsupported_requests_cannot_select_an_item() {
+        let mut list = list();
+        let old = click(&list.option_ids[0]);
+        let _ = list.live_options.lock().unwrap().sync(&["replacement"]);
+        let mut messages = Vec::new();
+        let mut unsupported = old.clone();
+        if let Event::A11y(_, ref mut request) = unsupported {
+            request.action = Action::Focus;
+        }
+        for event in [old, unsupported, click(&iced_core::widget::Id::unique())] {
+            let mut shell = Shell::new(&mut messages);
+            list.accessible_action(&event, &mut shell);
+            assert!(!shell.is_event_captured());
+        }
+        assert!(messages.is_empty());
+        assert!(list.is_open.as_ref().unwrap().load(Ordering::Relaxed));
     }
 }

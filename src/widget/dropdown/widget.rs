@@ -26,6 +26,10 @@ pub type DropdownView<Message> = Arc<dyn Fn() -> Element<'static, Message> + Sen
 static AUTOSIZE_ID: LazyLock<crate::widget::Id> =
     LazyLock::new(|| crate::widget::Id::new("cosmic-applet-autosize"));
 
+#[cfg(all(test, feature = "a11y"))]
+#[path = "a11y_tests.rs"]
+mod a11y_tests;
+
 /// A widget for selecting a single value from a list of selections.
 #[derive(Setters)]
 pub struct Dropdown<'a, S: AsRef<str> + Send + Sync + Clone + 'static, Message, AppMessage>
@@ -34,6 +38,9 @@ where
 {
     #[setters(skip)]
     id: Option<Id>,
+    /// Accessible name independent of the selected value.
+    #[setters(strip_option, into)]
+    name: Option<Cow<'a, str>>,
     #[setters(skip)]
     on_selected: Arc<dyn Fn(usize) -> Message + Send + Sync>,
     #[setters(skip)]
@@ -83,7 +90,8 @@ where
         on_selected: impl Fn(usize) -> Message + 'static + Send + Sync,
     ) -> Self {
         Self {
-            id: None,
+            id: Some(Id::unique()),
+            name: None,
             on_selected: Arc::new(on_selected),
             selections,
             icons: Cow::Borrowed(&[]),
@@ -114,6 +122,7 @@ where
     ) -> Dropdown<'a, S, Message, NewAppMessage> {
         let Self {
             id,
+            name,
             on_selected,
             selections,
             icons,
@@ -131,6 +140,7 @@ where
 
         Dropdown::<'a, S, Message, NewAppMessage> {
             id,
+            name,
             on_selected,
             selections,
             icons,
@@ -154,6 +164,80 @@ where
         self
     }
 
+    fn control_event(&self, event: &Event, state: &mut State, shell: &mut Shell<'_, Message>) {
+        if self.selections.is_empty() {
+            return;
+        }
+        match event {
+            #[cfg(feature = "a11y")]
+            Event::A11y(target, request) => {
+                use iced_accessibility::accesskit::{Action, NodeId};
+                let Some(id) = self.id.as_ref() else {
+                    return;
+                };
+                if u64::from(target.clone()) != u64::from(id.clone())
+                    || request.target_node != NodeId(u64::from(id.clone()))
+                    || request.data.is_some()
+                {
+                    return;
+                }
+                match request.action {
+                    Action::Click => {
+                        if state.is_open.load(Ordering::Relaxed) {
+                            state.close_operation = true;
+                        } else {
+                            state.close_operation = false;
+                            state.open_operation = true;
+                        }
+                    }
+                    // The runtime has already applied exclusive focus.
+                    Action::Focus => {}
+                    _ => return,
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) if state.is_focused => {
+                use keyboard::key::Named;
+                match key {
+                    key if (*key == keyboard::Key::Named(Named::Enter)
+                        || key.as_ref() == keyboard::Key::Character(" "))
+                        && !state.is_open.load(Ordering::Relaxed) =>
+                    {
+                        state.close_operation = false;
+                        state.open_operation = true;
+                    }
+                    keyboard::Key::Named(Named::Escape)
+                        if state.is_open.load(Ordering::Relaxed) =>
+                    {
+                        state.close_operation = true;
+                    }
+                    keyboard::Key::Named(Named::Tab) => {
+                        state.close_operation = true;
+                        return;
+                    }
+                    keyboard::Key::Named(direction @ (Named::ArrowDown | Named::ArrowUp))
+                        if !state.is_open.load(Ordering::Relaxed) =>
+                    {
+                        let next = match (
+                            direction,
+                            self.selected.filter(|i| *i < self.selections.len()),
+                        ) {
+                            (Named::ArrowDown, Some(i)) => (i + 1).min(self.selections.len() - 1),
+                            (Named::ArrowUp, Some(i)) => i.saturating_sub(1),
+                            _ => 0,
+                        };
+                        if self.selected != Some(next) {
+                            shell.publish((self.on_selected)(next));
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        }
+        shell.request_redraw();
+        shell.capture_event();
+    }
+
     #[cfg(wayland_platform)]
     pub fn with_positioner(
         mut self,
@@ -174,6 +258,13 @@ where
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
+    }
+
+    fn id(&self) -> Option<Id> {
+        self.id.clone()
+    }
+    fn set_id(&mut self, id: Id) {
+        self.id = Some(id);
     }
 
     fn state(&self) -> tree::State {
@@ -263,6 +354,14 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        let state = tree.state.downcast_mut::<State>();
+        if self.selections.is_empty() {
+            state.is_focused = false;
+            state.close_operation = state.is_open.load(Ordering::Relaxed);
+            state.open_operation = false;
+        } else {
+            self.control_event(event, state, shell);
+        }
         update::<S, Message, AppMessage>(
             &event,
             layout,
@@ -333,9 +432,10 @@ where
         _renderer: &crate::Renderer,
         operation: &mut dyn iced_core::widget::Operation,
     ) {
-        // TODO: double check operation handling
-        // let state = tree.state.downcast_mut::<State>();
-        // operation.custom(state, self.id.as_ref());
+        let state = tree.state.downcast_mut::<State>();
+        if !self.selections.is_empty() {
+            operation.focusable(self.id.as_ref(), _layout.bounds(), state);
+        }
     }
 
     fn overlay<'b>(
@@ -371,16 +471,51 @@ where
         )
     }
 
-    // #[cfg(feature = "a11y")]
-    // /// get the a11y nodes for the widget
-    // fn a11y_nodes(
-    //     &self,
-    //     layout: Layout<'_>,
-    //     state: &Tree,
-    //     p: mouse::Cursor,
-    // ) -> iced_accessibility::A11yTree {
-    //     // TODO
-    // }
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        _: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+        let state = tree.state.downcast_ref::<State>();
+        let mut node = Node::new(Role::ComboBox);
+        let value = self
+            .selected
+            .and_then(|i| self.selections.get(i))
+            .map(AsRef::as_ref)
+            .unwrap_or("");
+        node.set_label(
+            self.name
+                .as_deref()
+                .or(self.placeholder.as_deref())
+                .unwrap_or(value),
+        );
+        node.set_value(value);
+        node.set_expanded(state.is_open.load(Ordering::Relaxed));
+        let bounds = layout.bounds();
+        node.set_bounds(Rect::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            (bounds.x + bounds.width) as f64,
+            (bounds.y + bounds.height) as f64,
+        ));
+        if self.selections.is_empty() {
+            node.set_disabled();
+        } else {
+            node.add_action(Action::Focus);
+            node.add_action(Action::Click);
+        }
+        if let Some(id) = self.id.as_ref() {
+            if let Some(author_id) = id.author_id() {
+                node.set_author_id(author_id);
+            }
+            iced_accessibility::A11yTree::leaf(node, id.clone())
+        } else {
+            iced_accessibility::A11yTree::default()
+        }
+    }
 }
 
 impl<
@@ -400,6 +535,7 @@ where
 /// The local state of a [`Dropdown`].
 #[derive(Debug, Clone)]
 pub struct State {
+    is_focused: bool,
     icon: Option<svg::Handle>,
     menu: menu::State,
     keyboard_modifiers: keyboard::Modifiers,
@@ -416,6 +552,7 @@ impl State {
     /// Creates a new [`State`] for a [`Dropdown`].
     pub fn new() -> Self {
         Self {
+            is_focused: false,
             icon: match icon::from_name("pan-down-symbolic").size(16).handle().data {
                 icon::Data::Svg(handle) => Some(handle),
                 icon::Data::Image(_) => None,
@@ -436,6 +573,19 @@ impl State {
 impl Default for State {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl iced_core::widget::operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+    fn focus(&mut self) {
+        self.is_focused = true;
+    }
+    fn unfocus(&mut self) {
+        self.is_focused = false;
+        self.close_operation = self.is_open.load(Ordering::Relaxed);
     }
 }
 
@@ -689,7 +839,8 @@ pub fn update<
                     shell.publish(on_close(surface::action::destroy_popup(state.popup_id)));
                 }
                 shell.capture_event();
-            } else if cursor.is_over(layout.bounds()) {
+            } else if !selections.is_empty() && cursor.is_over(layout.bounds()) {
+                state.is_focused = true;
                 open(shell, state, on_selected);
                 shell.capture_event();
             }
@@ -777,6 +928,7 @@ where
         None,
         close_on_selected,
     )
+    .open_state(state.is_open.clone())
     .width(width)
     .padding(padding)
     .text_size(text_size);
@@ -830,6 +982,7 @@ where
             None,
             close_on_selected,
         )
+        .open_state(state.is_open.clone())
         .width({
             let measure = |_label: &str, selection_paragraph: &crate::Paragraph| -> f32 {
                 selection_paragraph.min_width().round()
